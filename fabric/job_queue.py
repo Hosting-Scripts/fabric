@@ -179,7 +179,8 @@ class JobQueue(object):
             # Allow some context switching
             time.sleep(ssh.io_sleep)
 
-            self.pbar.update(len(self._completed))
+            if len(self._completed):
+                self.pbar.update(len(self._completed))
 
         # Make sure to drain the comms queue since all jobs are completed
         while True:
