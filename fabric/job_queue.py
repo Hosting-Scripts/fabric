@@ -60,7 +60,7 @@ class JobQueue(object):
         self._closed = False
 
         widgets = ['Running tasks: ', Percentage(), ' ', Bar(), ' ', SimpleProgress(), ETA()]
-        self.pbar = ProgressBar(widgets=widgets, maxval=self._num_of_jobs)
+        self.pbar = ProgressBar(widgets=widgets)
 
     def __len__(self):
         """
@@ -96,6 +96,9 @@ class JobQueue(object):
             self._pools[role]['queue'].appendleft(process)
 
             self._num_of_jobs += 1
+
+            self.pbar.maxval = self._num_of_jobs
+
             if self._debug:
                 print("JOB QUEUE: %s: added %s" % (role, process.name))
 
@@ -179,8 +182,7 @@ class JobQueue(object):
             # Allow some context switching
             time.sleep(ssh.io_sleep)
 
-            if len(self._completed):
-                self.pbar.update(len(self._completed))
+            self.pbar.update(len(self._completed))
 
         # Make sure to drain the comms queue since all jobs are completed
         while True:
