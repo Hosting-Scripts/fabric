@@ -11,6 +11,8 @@ import Queue
 
 from collections import deque
 
+from progressbar import Bar, ETA, Percentage, ProgressBar, SimpleProgress
+
 from fabric.network import ssh
 
 
@@ -56,6 +58,9 @@ class JobQueue(object):
         self._num_of_jobs = 0
         self._finished = False
         self._closed = False
+
+        widgets = ['Running tasks: ', Percentage(), ' ', Bar(), ' ', SimpleProgress(), ETA()]
+        self.pbar = ProgressBar(widgets=widgets, maxval=self._num_of_jobs)
 
     def __len__(self):
         """
@@ -128,7 +133,10 @@ class JobQueue(object):
             else:
                 results[datum['name']]['result'] = datum['result']
 
+
         results = {}
+
+        self.pbar.start()
 
         while len(self._completed) < self._num_of_jobs:
             for pool_name, pool in self._pools.iteritems():
@@ -171,12 +179,16 @@ class JobQueue(object):
             # Allow some context switching
             time.sleep(ssh.io_sleep)
 
+            self.pbar.update(len(self._completed))
+
         # Make sure to drain the comms queue since all jobs are completed
         while True:
             try:
                 _consume_result(self._comms_queue, results)
             except Queue.Empty:
                 break
+
+        self.pbar.finish()
 
         return results
 
