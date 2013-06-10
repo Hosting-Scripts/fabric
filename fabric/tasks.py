@@ -338,7 +338,9 @@ def execute(task, *args, **kwargs):
     pool_size = task.get_pool_size(my_env['all_hosts'], state.env.pool_size)
     # Set up job queue in case parallel is needed
     queue = multiprocessing.Queue() if parallel else None
-    jobs = JobQueue(pool_size, queue)
+    role_limits = state.env.get('role_limits', None)
+    jobs = JobQueue(pool_size, queue, role_limits=role_limits,
+                    debug=state.output.debug)
     if state.output.debug:
         jobs._debug = True
 
