@@ -3,7 +3,9 @@ Convenience decorators for use in fabfiles.
 """
 from __future__ import with_statement
 
+import types
 from functools import wraps
+
 from Crypto import Random
 
 from fabric import tasks
@@ -23,31 +25,41 @@ def task(*args, **kwargs):
     .. versionchanged:: 1.2
         Added the ``alias``, ``aliases``, ``task_class`` and ``default``
         keyword arguments. See :ref:`task-decorator-arguments` for details.
-    """
-    def wrapped_task_from_fun(**opts):
-        def task_from_fun(fun):
-            Task = type(fun.__name__, (tasks.Task,), dict({
-                'run': staticmethod(fun),
-                '__name__': fun.__name__,
-                '__doc__': fun.__doc__,
-                '__module__': fun.__module__},
-                **fun.__dict__))
-            return Task(name=fun.__name__, **opts)
-        return task_from_fun
+    .. versionchanged:: 1.5
+        Added the ``name`` keyword argument.
 
-    if len(args) == 1 and callable(args[0]):
-        return wrapped_task_from_fun()(args[0])
-    return wrapped_task_from_fun(**kwargs)
+    .. seealso:: `~fabric.docs.unwrap_tasks`, `~fabric.tasks.WrappedCallableTask`
+    """
+    invoked = bool(not args or kwargs)
+    task_class = kwargs.pop("task_class", tasks.WrappedCallableTask)
+    if not invoked:
+        func, args = args[0], ()
+
+    def wrapper(func):
+        return task_class(func, *args, **kwargs)
+
+    return wrapper if invoked else wrapper(func)
+
+def _wrap_as_new(original, new):
+    if isinstance(original, tasks.Task):
+        return tasks.WrappedCallableTask(new)
+    return new
 
 
 def _list_annotating_decorator(attribute, *values):
     def attach_list(func):
+        @wraps(func)
+        def inner_decorator(*args, **kwargs):
+            return func(*args, **kwargs)
         _values = values
         # Allow for single iterable argument as well as *args
         if len(_values) == 1 and not isinstance(_values[0], basestring):
             _values = _values[0]
-        setattr(func, attribute, list(_values))
-        return func
+        setattr(inner_decorator, attribute, list(_values))
+        # Don't replace @task new-style task objects with inner_decorator by
+        # itself -- wrap in a new Task object first.
+        inner_decorator = _wrap_as_new(func, inner_decorator)
+        return inner_decorator
     return attach_list
 
 
@@ -118,12 +130,15 @@ def runs_once(func):
     Any function wrapped with this decorator will silently fail to execute the
     2nd, 3rd, ..., Nth time it is called, and will return the value of the
     original run.
+    
+    .. note:: ``runs_once`` does not work with parallel task execution.
     """
     @wraps(func)
     def decorated(*args, **kwargs):
         if not hasattr(decorated, 'return_value'):
             decorated.return_value = func(*args, **kwargs)
         return decorated.return_value
+    decorated = _wrap_as_new(func, decorated)
     # Mark as serial (disables parallelism) and return
     return serial(decorated)
 
@@ -141,7 +156,7 @@ def serial(func):
     """
     if not getattr(func, 'parallel', False):
         func.serial = True
-    return func
+    return _wrap_as_new(func, func)
 
 
 def parallel(pool_size=None):
@@ -154,21 +169,23 @@ def parallel(pool_size=None):
 
     .. versionadded:: 1.3
     """
+    called_without_args = type(pool_size) == types.FunctionType
+
     def real_decorator(func):
         @wraps(func)
         def inner(*args, **kwargs):
             # Required for ssh/PyCrypto to be happy in multiprocessing
             # (as far as we can tell, this is needed even with the extra such
-            # calls in newer versions of the 'ssh' library.)
+            # calls in newer versions of paramiko.)
             Random.atfork()
             return func(*args, **kwargs)
         inner.parallel = True
         inner.serial = False
-        inner.pool_size = pool_size
-        return inner
+        inner.pool_size = None if called_without_args else pool_size
+        return _wrap_as_new(func, inner)
 
     # Allow non-factory-style decorator use (@decorator vs @decorator())
-    if type(pool_size) == type(real_decorator):
+    if called_without_args:
         return real_decorator(pool_size)
 
     return real_decorator
@@ -197,5 +214,5 @@ def with_settings(*arg_settings, **kw_settings):
         def inner(*args, **kwargs):
             with settings(*arg_settings, **kw_settings):
                 return func(*args, **kwargs)
-        return inner
+        return _wrap_as_new(func, inner)
     return outer

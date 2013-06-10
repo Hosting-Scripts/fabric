@@ -3,10 +3,12 @@ from __future__ import with_statement
 import copy
 from functools import partial
 from operator import isMappingType
+import os
 import sys
+from contextlib import contextmanager
 
-from fudge import Fake, patched_context
-from nose.tools import ok_
+from fudge import Fake, patched_context, with_fakes
+from nose.tools import ok_, eq_
 
 from fabric.decorators import hosts, roles, task
 from fabric.context_managers import settings
@@ -14,10 +16,11 @@ from fabric.main import (parse_arguments, _escape_split,
         load_fabfile as _load_fabfile, list_commands, _task_names,
         COMMANDS_HEADER, NESTED_REMINDER)
 import fabric.state
-from fabric.tasks import Task
+from fabric.state import _AttributeDict
+from fabric.tasks import Task, WrappedCallableTask
 from fabric.task_utils import _crawl, crawl, merge
 
-from utils import eq_, FabricTest, fabfile, path_prefix, aborts
+from utils import mock_streams, eq_, FabricTest, fabfile, path_prefix, aborts
 
 
 # Stupid load_fabfile wrapper to hide newly added return value.
@@ -32,7 +35,7 @@ def load_fabfile(*args, **kwargs):
 
 def test_argument_parsing():
     for args, output in [
-        # Basic
+        # Basic 
         ('abc', ('abc', [], {}, [], [], [])),
         # Arg
         ('ab:c', ('ab', ['c'], {}, [], [], [])),
@@ -41,7 +44,7 @@ def test_argument_parsing():
         # Arg and kwarg
         ('a:b=c,d', ('a', ['d'], {'b':'c'}, [], [], [])),
         # Multiple kwargs
-        ('a:b=c,d=e', ('a', [], {'b':'c', 'd':'e'}, [], [], [])),
+        ('a:b=c,d=e', ('a', [], {'b':'c','d':'e'}, [], [], [])),
         # Host
         ('abc:host=foo', ('abc', [], {}, ['foo'], [], [])),
         # Hosts with single host
@@ -53,7 +56,7 @@ def test_argument_parsing():
 
         # Exclude hosts
         ('abc:hosts=foo;bar,exclude_hosts=foo', ('abc', [], {}, ['foo', 'bar'], [], ['foo'])),
-        ('abc:hosts=foo;bar,exclude_hosts=foo;bar', ('abc', [], {}, ['foo', 'bar'], [], ['foo', 'bar'])),
+        ('abc:hosts=foo;bar,exclude_hosts=foo;bar', ('abc', [], {}, ['foo', 'bar'], [], ['foo','bar'])),
        # Empty string args
         ("task:x=y,z=", ('task', [], {'x': 'y', 'z': ''}, [], [], [])),
         ("task:foo,,x=y", ('task', ['foo', ''], {'x': 'y'}, [], [], [])),
@@ -85,23 +88,19 @@ def test_escaped_task_kwarg_split():
     )
 
 
+
 #
 # Host/role decorators
 #
 
 # Allow calling Task.get_hosts as function instead (meh.)
 def get_hosts(command, *args):
-    if isinstance(command, Task):
-        return command.get_hosts(*args)
-    return task(command).get_hosts(*args)
-
+    return WrappedCallableTask(command).get_hosts(*args)
 
 def eq_hosts(command, host_list, env=None, func=set):
     eq_(func(get_hosts(command, [], [], [], env)), func(host_list))
 
-
 true_eq_hosts = partial(eq_hosts, func=lambda x: x)
-
 
 def test_hosts_decorator_by_itself():
     """
@@ -121,7 +120,6 @@ fake_roles = {
     'r2': ['b', 'c']
 }
 
-
 def test_roles_decorator_by_itself():
     """
     Use of @roles only
@@ -130,7 +128,6 @@ def test_roles_decorator_by_itself():
     def command():
         pass
     eq_hosts(command, ['a', 'b'], env={'roledefs': fake_roles})
-
 
 def test_hosts_and_roles_together():
     """
@@ -142,7 +139,6 @@ def test_hosts_and_roles_together():
         pass
     eq_hosts(command, ['a', 'b', 'c', 'd'], env={'roledefs': fake_roles})
 
-
 def test_host_role_merge_deduping():
     """
     Use of @roles and @hosts dedupes when merging
@@ -153,7 +149,6 @@ def test_host_role_merge_deduping():
         pass
     # Not ['a', 'a', 'b', 'c'] or etc
     true_eq_hosts(command, ['a', 'b', 'c'], env={'roledefs': fake_roles})
-
 
 def test_host_role_merge_deduping_off():
     """
@@ -177,7 +172,6 @@ tuple_roles = {
     'r1': ('a', 'b'),
     'r2': ('b', 'c'),
 }
-
 
 def test_roles_as_tuples():
     """
@@ -208,7 +202,6 @@ def test_hosts_decorator_overrides_env_hosts():
     eq_hosts(command, ['bar'])
     assert 'foo' not in get_hosts(command, [], [], [], {'hosts': ['foo']})
 
-
 def test_hosts_decorator_overrides_env_hosts_with_task_decorator_first():
     """
     If @hosts is used it replaces any env.hosts value even with @task
@@ -220,7 +213,6 @@ def test_hosts_decorator_overrides_env_hosts_with_task_decorator_first():
     eq_hosts(command, ['bar'])
     assert 'foo' not in get_hosts(command, [], [], {'hosts': ['foo']})
 
-
 def test_hosts_decorator_overrides_env_hosts_with_task_decorator_last():
     @hosts('bar')
     @task
@@ -228,7 +220,6 @@ def test_hosts_decorator_overrides_env_hosts_with_task_decorator_last():
         pass
     eq_hosts(command, ['bar'])
     assert 'foo' not in get_hosts(command, [], [], {'hosts': ['foo']})
-
 
 def test_hosts_stripped_env_hosts():
     """
@@ -244,7 +235,6 @@ spaced_roles = {
     'r1': [' a ', ' b '],
     'r2': ['b', 'c'],
 }
-
 
 def test_roles_stripped_env_hosts():
     """
@@ -268,7 +258,6 @@ def test_hosts_decorator_expands_single_iterable():
 
     eq_(command.hosts, host_list)
 
-
 def test_roles_decorator_expands_single_iterable():
     """
     @roles(iterable) should behave like @roles(*iterable)
@@ -286,23 +275,18 @@ def test_roles_decorator_expands_single_iterable():
 # Host exclusion
 #
 
+def dummy(): pass
+
 def test_get_hosts_excludes_cli_exclude_hosts_from_cli_hosts():
-    def dummy():
-        pass
     assert 'foo' not in get_hosts(dummy, ['foo', 'bar'], [], ['foo'])
 
-
 def test_get_hosts_excludes_cli_exclude_hosts_from_decorator_hosts():
-    def dummy():
-        pass
     assert 'foo' not in get_hosts(hosts('foo', 'bar')(dummy), [], [], ['foo'])
 
-
 def test_get_hosts_excludes_global_exclude_hosts_from_global_hosts():
-    def dummy():
-        pass
     fake_env = {'hosts': ['foo', 'bar'], 'exclude_hosts': ['foo']}
     assert 'foo' not in get_hosts(dummy, [], [], [], fake_env)
+
 
 
 #
@@ -316,9 +300,14 @@ def test_aborts_on_nonexistent_roles():
     """
     merge([], ['badrole'], [], {})
 
+def test_accepts_non_list_hosts():
+    """
+     Aborts if hosts is a string, not a list
+    """
+    assert merge('badhosts', [], [], {}) == ['badhosts']
+
 
 lazy_role = {'r1': lambda: ['a', 'b']}
-
 
 def test_lazy_roles():
     """
@@ -348,7 +337,6 @@ def run_load_fabfile(path, sys_path):
     eq_(sys.path, sys_path)
     # Restore
     sys.path = orig_path
-
 
 def test_load_fabfile_should_not_remove_real_path_elements():
     for fabfile_path, sys_dot_path in (
@@ -415,7 +403,7 @@ class TestNamespaces(FabricTest):
         super(TestNamespaces, self).setup()
         # Reset new-style-tests flag so running tests via Fab itself doesn't
         # muck with it.
-        import fabric.state  # noqa
+        import fabric.state
         if 'new_style_tasks' in fabric.state.env:
             del fabric.state.env['new_style_tasks']
 
@@ -456,10 +444,24 @@ class TestNamespaces(FabricTest):
         Wrapped new-style tasks should preserve their function names
         """
         module = fabfile('decorated_fabfile_with_classbased_task.py')
+        from fabric.state import env
         with path_prefix(module):
             docs, funcs = load_fabfile(module)
             eq_(len(funcs), 1)
             ok_('foo' in funcs)
+
+    def test_class_based_tasks_are_found_with_variable_name(self):
+        """
+        A new-style tasks with undefined name attribute should use the instance
+        variable name.
+        """
+        module = fabfile('classbased_task_fabfile.py')
+        from fabric.state import env
+        with path_prefix(module):
+            docs, funcs = load_fabfile(module)
+            eq_(len(funcs), 1)
+            ok_('foo' in funcs)
+            eq_(funcs['foo'].name, 'foo')
 
     def test_recursion_steps_into_nontask_modules(self):
         """
@@ -502,14 +504,12 @@ def eq_output(docstring, format_, expected):
         expected
     )
 
-
 def list_output(module, format_, expected):
     module = fabfile(module)
     with path_prefix(module):
         docstring, tasks = load_fabfile(module)
         with patched_context(fabric.state, 'commands', tasks):
             eq_output(docstring, format_, expected)
-
 
 def test_list_output():
     lead = ":\n\n    "
@@ -541,7 +541,6 @@ def name_to_task(name):
     t.name = name
     return t
 
-
 def strings_to_tasks(d):
     ret = {}
     for key, value in d.iteritems():
@@ -551,7 +550,6 @@ def strings_to_tasks(d):
             val = name_to_task(value)
         ret[key] = val
     return ret
-
 
 def test_task_names():
     for desc, input_, output in (

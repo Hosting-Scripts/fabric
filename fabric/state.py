@@ -6,7 +6,7 @@ import os
 import sys
 from optparse import make_option
 
-from fabric.network import HostConnectionCache
+from fabric.network import HostConnectionCache, ssh
 from fabric.version import get_version
 from fabric.utils import _AliasDict, _AttributeDict
 
@@ -46,11 +46,10 @@ def _get_system_username():
     except ImportError:
         if win32:
             import win32api
-            import win32security  # noqa
-            import win32profile  # noqa
+            import win32security
+            import win32profile
             username = win32api.GetUserName()
     return username
-
 
 def _rc_path():
     """
@@ -65,7 +64,7 @@ def _rc_path():
             expanded_rc_path = "%s/%s" % (
                 SHGetSpecialFolderPath(0, CSIDL_PROFILE),
                 rc_file
-            )
+                )
     return expanded_rc_path
 
 default_port = '22'  # hurr durr
@@ -118,10 +117,22 @@ env_options = [
         help="do not load user known_hosts file"
     ),
 
+    make_option('-e', '--eagerly-disconnect',
+        action='store_true',
+        default=False,
+        help="disconnect from hosts as soon as possible"
+    ),
+
     make_option('-f', '--fabfile',
         default='fabfile',
         metavar='PATH',
         help="python module file to import, e.g. '../other.py'"
+    ),
+
+    make_option('-g', '--gateway',
+        default=None,
+        metavar='HOST',
+        help="gateway host to connect through"
     ),
 
     make_option('--hide',
@@ -200,6 +211,11 @@ env_options = [
         help="reject unknown hosts"
     ),
 
+    make_option('--system-known-hosts',
+        default=None,
+        help="load system known_hosts file before reading user known_hosts"
+    ),
+
     make_option('-R', '--roles',
         default=[],
         help="comma-separated list of roles to operate on"
@@ -232,6 +248,14 @@ env_options = [
         default=10,
         metavar="N",
         help="set connection timeout to N seconds"
+    ),
+
+    make_option('-T', '--command-timeout',
+        dest='command_timeout',
+        type='int',
+        default=None,
+        metavar="N",
+        help="set remote command timeout to N seconds"
     ),
 
     make_option('-u', '--user',
@@ -281,8 +305,10 @@ env = _AttributeDict({
     'cwd': '',  # Must be empty string, not None, for concatenation purposes
     'dedupe_hosts': True,
     'default_port': default_port,
+    'eagerly_disconnect': False,
     'echo_stdin': True,
     'exclude_hosts': [],
+    'gateway': None,
     'host': None,
     'host_string': None,
     'lcwd': '',  # Must be empty string, not None, for concatenation purposes
@@ -293,16 +319,19 @@ env = _AttributeDict({
     'path_behavior': 'append',
     'port': default_port,
     'real_fabfile': None,
+    'remote_interrupt': None,
     'roles': [],
     'roledefs': {},
     'shell_env': {},
     'skip_bad_hosts': False,
     'ssh_config_path': default_ssh_config_path,
+    'ok_ret_codes': [0],     # a list of return codes that indicate success
     # -S so sudo accepts passwd via stdin, -p with our known-value prompt for
     # later detection (thus %s -- gets filled with env.sudo_prompt at runtime)
     'sudo_prefix': "sudo -S -p '%(sudo_prompt)s' ",
     'sudo_prompt': 'sudo password:',
     'sudo_user': None,
+    'tasks': [],
     'use_exceptions_for': {'network': False},
     'use_shell': True,
     'use_ssh_config': False,
@@ -339,11 +368,24 @@ commands = {}
 connections = HostConnectionCache()
 
 
+def _open_session():
+    return connections[env.host_string].get_transport().open_session()
+
+
 def default_channel():
     """
     Return a channel object based on ``env.host_string``.
     """
-    chan = connections[env.host_string].get_transport().open_session()
+    try:
+        chan = _open_session()
+    except ssh.SSHException, err:
+        if str(err) == 'SSH session not active':
+            connections[env.host_string].close()
+            del connections[env.host_string]
+            chan = _open_session()
+        else:
+            raise
+    chan.settimeout(0.1)
     chan.input_enabled = True
     return chan
 

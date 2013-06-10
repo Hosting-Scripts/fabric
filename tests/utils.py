@@ -2,6 +2,8 @@ from __future__ import with_statement
 
 from StringIO import StringIO  # No need for cStringIO at this time
 from contextlib import contextmanager
+from copy import deepcopy
+from fudge.patcher import with_patched_object
 from functools import wraps, partial
 from types import StringTypes
 import copy
@@ -14,10 +16,13 @@ import tempfile
 
 from fudge import Fake, patched_context, clear_expectations, with_patched_object
 from nose.tools import raises
+from nose import SkipTest
 
+from fabric.context_managers import settings
 from fabric.state import env, output
 from fabric.sftp import SFTP
-from fabric.network import to_dict
+import fabric.network
+from fabric.network import normalize, to_dict
 
 from server import PORT, PASSWORDS, USER, HOST
 
@@ -53,7 +58,7 @@ class FabricTest(object):
         env.use_shell = False
 
     def teardown(self):
-        env.clear()  # In case tests set env vars that didn't exist previously
+        env.clear() # In case tests set env vars that didn't exist previously
         env.update(self.previous_env)
         output.update(self.previous_output)
         shutil.rmtree(self.tmpdir)
@@ -141,7 +146,7 @@ def mock_streams(which):
             if stderr:
                 my_stderr, sys.stderr = sys.stderr, fake_stderr
             try:
-                func(*args, **kwargs)
+                ret = func(*args, **kwargs)
             finally:
                 if stdout:
                     sys.stdout = my_stdout

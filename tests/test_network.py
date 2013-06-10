@@ -1,22 +1,28 @@
 from __future__ import with_statement
 
+from datetime import datetime
+import copy
+import getpass
 import sys
 
-import ssh
-from nose.tools import ok_
-from fudge import (Fake, patch_object, patched_context, with_fakes)
+from nose.tools import with_setup, ok_, raises
+from fudge import (Fake, clear_calls, clear_expectations, patch_object, verify,
+    with_patched_object, patched_context, with_fakes)
 
 from fabric.context_managers import settings, hide, show
 from fabric.network import (HostConnectionCache, join_host_strings, normalize,
-                            denormalize, key_filenames)
-#import fabric.network  # So I can call patch_object correctly. Sigh.
+    denormalize, key_filenames, ssh)
+from fabric.io import output_loop
+import fabric.network  # So I can call patch_object correctly. Sigh.
 from fabric.state import env, output, _get_system_username
 from fabric.operations import run, sudo, prompt
+from fabric.exceptions import NetworkError
 from fabric.tasks import execute
+from fabric import utils # for patching
 
 from utils import *
-from server import (server, RESPONSES, PASSWORDS, CLIENT_PRIVKEY, USER,
-                    CLIENT_PRIVKEY_PASSPHRASE)
+from server import (server, PORT, RESPONSES, PASSWORDS, CLIENT_PRIVKEY, USER,
+    CLIENT_PRIVKEY_PASSPHRASE)
 
 
 #
@@ -41,6 +47,29 @@ class TestNetwork(FabricTest):
             yield eq_, normalize(input), normalize(output_)
             del eq_.description
 
+    def test_normalization_for_ipv6(self):
+        """
+        normalize() will accept IPv6 notation and can separate host and port
+        """
+        username = _get_system_username()
+        for description, input, output_ in (
+            ("Full IPv6 address",
+                '2001:DB8:0:0:0:0:0:1', (username, '2001:DB8:0:0:0:0:0:1', '22')),
+            ("IPv6 address in short form",
+                '2001:DB8::1', (username, '2001:DB8::1', '22')),
+            ("IPv6 localhost",
+                '::1', (username, '::1', '22')),
+            ("Square brackets are required to separate non-standard port from IPv6 address",
+                '[2001:DB8::1]:1222', (username, '2001:DB8::1', '1222')),
+            ("Username and IPv6 address",
+                'user@2001:DB8::1', ('user', '2001:DB8::1', '22')),
+            ("Username and IPv6 address with non-standard port",
+                'user@[2001:DB8::1]:1222', ('user', '2001:DB8::1', '1222')),
+        ):
+            eq_.description = "Host-string IPv6 normalization: %s" % description
+            yield eq_, normalize(input), output_
+            del eq_.description
+
     def test_normalization_without_port(self):
         """
         normalize() and join_host_strings() omit port if omit_port given
@@ -48,6 +77,23 @@ class TestNetwork(FabricTest):
         eq_(
             join_host_strings(*normalize('user@localhost', omit_port=True)),
             'user@localhost'
+        )
+
+    def test_ipv6_host_strings_join(self):
+        """
+        join_host_strings() should use square brackets only for IPv6 and if port is given
+        """
+        eq_(
+            join_host_strings('user', '2001:DB8::1'),
+            'user@2001:DB8::1'
+        )
+        eq_(
+            join_host_strings('user', '2001:DB8::1', '1222'),
+            'user@[2001:DB8::1]:1222'
+        )
+        eq_(
+            join_host_strings('user', '192.168.0.0', '1222'),
+            'user@192.168.0.0:1222'
         )
 
     def test_nonword_character_in_username(self):
@@ -89,6 +135,8 @@ class TestNetwork(FabricTest):
                 'user@localhost', 'user@localhost:22'),
             ("Both username and port",
                 'localhost', username + '@localhost:22'),
+            ("IPv6 address",
+                '2001:DB8::1', username + '@[2001:DB8::1]:22'),
         ):
             eq_.description = "Host-string denormalization: %s" % description
             yield eq_, denormalize(string1), denormalize(string2)
@@ -138,7 +186,7 @@ class TestNetwork(FabricTest):
         fake = Fake('connect', callable=True)
         with patched_context('fabric.network', 'connect', fake):
             for host_string in ('hostname', 'user@hostname',
-                                'user@hostname:222'):
+                'user@hostname:222'):
                 # Prime
                 hcc[host_string]
                 # Test
@@ -147,6 +195,7 @@ class TestNetwork(FabricTest):
                 del hcc[host_string]
                 # Test
                 ok_(host_string not in hcc)
+
 
     #
     # Connection loop flow
@@ -164,6 +213,7 @@ class TestNetwork(FabricTest):
             cache = HostConnectionCache()
             cache[env.host_string]
 
+
     @aborts
     def test_aborts_on_prompt_with_abort_on_prompt(self):
         """
@@ -171,6 +221,7 @@ class TestNetwork(FabricTest):
         """
         env.abort_on_prompts = True
         prompt("This will abort")
+
 
     @server()
     @aborts
@@ -184,6 +235,7 @@ class TestNetwork(FabricTest):
             cache = HostConnectionCache()
             cache[env.host_string]
 
+
     @mock_streams('stdout')
     @server()
     def test_does_not_abort_with_password_and_host_with_abort_on_prompt(self):
@@ -194,6 +246,7 @@ class TestNetwork(FabricTest):
         env.password = PASSWORDS[env.user]
         # env.host_string is automatically filled in when using server()
         run("ls /simple")
+
 
     @mock_streams('stdout')
     @server()
@@ -366,7 +419,7 @@ class TestNetwork(FabricTest):
 [%(prefix)s] out: result1
 [%(prefix)s] out: result2
 """ % {'prefix': env.host_string, 'user': env.user}
-        eq_(expected[1:], sys.stdall.getvalue())
+        eq_(sys.stdall.getvalue(), expected[1:])
 
     @mock_streams('both')
     @server(pubkeys=True, responses={'silent': '', 'normal': 'foo'})
@@ -477,7 +530,6 @@ result2
 def subtask():
     run("This should never execute")
 
-
 class TestConnections(FabricTest):
     @aborts
     def test_should_abort_when_cannot_connect(self):
@@ -563,10 +615,11 @@ class TestSSHConfig(FabricTest):
         eq_(normalize("localhost")[1], "localhost")
         eq_(normalize("myalias")[1], "otherhost")
 
-    @aborts
-    def test_aborts_with_bad_config_file_path(self):
+    @with_patched_object(utils, 'warn', Fake('warn', callable=True,
+        expect_call=True))
+    def test_warns_with_bad_config_file_path(self):
         # use_ssh_config is already set in our env_setup()
-        with settings(ssh_config_path="nope_bad_lol"):
+        with settings(hide('everything'), ssh_config_path="nope_bad_lol"):
             normalize('foo')
 
     @server()
@@ -622,14 +675,3 @@ class TestKeyFilenames(FabricTest):
             with settings(key_filename=["bizbaz.pub", "whatever.pub"]):
                 expected = ["bizbaz.pub", "whatever.pub", "foobar.pub"]
                 eq_(key_filenames(), expected)
-
-    def test_specific_host(self):
-        """
-        SSH lookup aspect should correctly select per-host value
-        """
-        with settings(
-            use_ssh_config=True,
-            ssh_config_path=support("ssh_config"),
-            host_string="myhost"
-        ):
-            eq_(key_filenames(), ["neighbor.pub"])

@@ -1,6 +1,6 @@
 from __future__ import with_statement
 
-from fabric.api import hide, get
+from fabric.api import hide, get, show
 from fabric.contrib.files import upload_template, contains
 
 from utils import FabricTest, eq_contents
@@ -11,7 +11,7 @@ class TestContrib(FabricTest):
     # Make sure it knows / is a directory.
     # This is in lieu of starting down the "actual honest to god fake operating
     # system" road...:(
-    @server(responses={'test -d /': ""})
+    @server(responses={'test -d "$(echo /)"': ""})
     def test_upload_template_uses_correct_remote_filename(self):
         """
         upload_template() shouldn't munge final remote filename
@@ -48,4 +48,4 @@ class TestContrib(FabricTest):
         """
         with hide('everything'):
             result = contains('/file.txt', 'text', use_sudo=True)
-            assert result is False
+            assert result == False

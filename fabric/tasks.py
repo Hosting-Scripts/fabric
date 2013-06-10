@@ -1,15 +1,21 @@
 from __future__ import with_statement
 
-from copy import copy
+
 import sys
 
 from fabric import state
-from fabric.context_managers import settings
-from fabric.exceptions import NetworkError
-from fabric.job_queue import JobQueue
-from fabric.network import to_dict
-from fabric.task_utils import crawl, merge, parse_kwargs
 from fabric.utils import abort, warn, error
+from fabric.network import to_dict, normalize_to_string, disconnect_all
+from fabric.context_managers import settings
+from fabric.job_queue import JobQueue
+from fabric.task_utils import crawl, merge, parse_kwargs
+from fabric.exceptions import NetworkError
+
+
+def _get_list(env):
+    def inner(key):
+        return env.get(key, [])
+    return inner
 
 
 class Task(object):
@@ -25,28 +31,23 @@ class Task(object):
 
     .. versionadded:: 1.1
     """
+    name = 'undefined'
     use_task_objects = True
+    aliases = None
+    is_default = False
 
     # TODO: make it so that this wraps other decorators as expected
-    def __init__(self, alias=None, aliases=None, default=False,
-                 *args, **kwargs):
-        self.name = kwargs.get('name', None) or getattr(self, 'name', 'undefined')
-        self.role = 'default'
-        self.aliases = getattr(self, 'aliases', [])
-        if getattr(self, 'alias', None):
-            self.aliases += [self.alias]
-        if aliases is not None:
-            self.aliases += aliases
+    def __init__(self, alias=None, aliases=None, default=False, name=None,
+        *args, **kwargs):
         if alias is not None:
-            self.aliases.append(alias)
+            self.aliases = [alias, ]
+        if aliases is not None:
+            self.aliases = aliases
+        if name is not None:
+            self.name = name
         self.is_default = default
-        self.hosts = kwargs.get('hosts', None) or getattr(self, 'hosts', [])
-        self.roles = kwargs.get('roles', None) or getattr(self, 'roles', [])
 
-    def __call__(self, *args, **kwargs):
-        return self.run(*args, **kwargs)
-
-    def run(self, *args, **kwargs):
+    def run(self):
         raise NotImplementedError
 
     def get_hosts(self, arg_hosts, arg_roles, arg_exclude_hosts, env=None):
@@ -62,13 +63,15 @@ class Task(object):
         if arg_hosts or arg_roles:
             return merge(arg_hosts, arg_roles, arg_exclude_hosts, roledefs)
         # Decorator-specific hosts/roles go next
-        if self.hosts or self.roles:
-            return merge(self.hosts, self.roles, arg_exclude_hosts, roledefs)
+        func_hosts = getattr(self, 'hosts', [])
+        func_roles = getattr(self, 'roles', [])
+        if func_hosts or func_roles:
+            return merge(func_hosts, func_roles, arg_exclude_hosts, roledefs)
         # Finally, the env is checked (which might contain globally set lists
         # from the CLI or from module-level code). This will be the empty list
         # if these have not been set -- which is fine, this method should
         # return an empty list if no hosts have been set anywhere.
-        env_vars = [env.get(k, []) for k in ['hosts', 'roles', 'exclude_hosts']]
+        env_vars = map(_get_list(env), "hosts roles exclude_hosts".split())
         env_vars.append(roledefs)
         return merge(*env_vars)
 
@@ -77,27 +80,50 @@ class Task(object):
         # change)
         default_pool_size = default or len(hosts)
         # Allow per-task override
-        pool_size = getattr(self, 'pool_size', default_pool_size)
+        # Also cast to int in case somebody gave a string
+        from_task = getattr(self, 'pool_size', None)
+        pool_size = int(from_task or default_pool_size)
         # But ensure it's never larger than the number of hosts
         pool_size = min((pool_size, len(hosts)))
         # Inform user of final pool size for this task
         if state.output.debug:
-            print "Parallel tasks now using pool size of %d" % pool_size
+            print("Parallel tasks now using pool size of %d" % pool_size)
         return pool_size
 
-    def get_role(self, host, arg_hosts, env=None):
-        """Return best guess for role for this task."""
-        if host in arg_hosts or host in self.hosts:
-            return 'default'
 
-        env = env or {'roledefs': {}}
-        roledefs = env.get('roledefs', {})
+class WrappedCallableTask(Task):
+    """
+    Wraps a given callable transparently, while marking it as a valid Task.
 
-        for role, hosts in roledefs.iteritems():
-            if host in hosts:
-                return role
-        else:
-            return 'default'
+    Generally used via `~fabric.decorators.task` and not directly.
+
+    .. versionadded:: 1.1
+
+    .. seealso:: `~fabric.docs.unwrap_tasks`, `~fabric.decorators.task`
+    """
+    def __init__(self, callable, *args, **kwargs):
+        super(WrappedCallableTask, self).__init__(*args, **kwargs)
+        self.wrapped = callable
+        # Don't use getattr() here -- we want to avoid touching self.name
+        # entirely so the superclass' value remains default.
+        if hasattr(callable, '__name__'):
+            if self.name == 'undefined':
+                self.__name__ = self.name = callable.__name__
+            else:
+                self.__name__ = self.name
+        if hasattr(callable, '__doc__'):
+            self.__doc__ = callable.__doc__
+        if hasattr(callable, '__module__'):
+            self.__module__ = callable.__module__
+
+    def __call__(self, *args, **kwargs):
+        return self.run(*args, **kwargs)
+
+    def run(self, *args, **kwargs):
+        return self.wrapped(*args, **kwargs)
+
+    def __getattr__(self, k):
+        return getattr(self.wrapped, k)
 
 
 def requires_parallel(task):
@@ -157,7 +183,7 @@ def parallel_task_target(task, args, kwargs, env, queue):
         raise
 
 
-def _execute(task, host, my_env, args, kwargs, jobs, queue):
+def _execute(task, host, my_env, args, kwargs, jobs, queue, multiprocessing):
     """
     Primary single-host work body of execute()
     """
@@ -165,29 +191,60 @@ def _execute(task, host, my_env, args, kwargs, jobs, queue):
     if state.output.running and not hasattr(task, 'return_value'):
         print("[%s] Executing task '%s'" % (host, my_env['command']))
     # Create per-run env with connection settings
-    local_env = copy(my_env)
-    local_env.update(to_dict(host))
+    local_env = to_dict(host)
+    local_env.update(my_env)
+    # Set a few more env flags for parallelism
+    if queue is not None:
+        local_env.update({'parallel': True, 'linewise': True})
+    # Handle parallel execution
+    if queue is not None: # Since queue is only set for parallel
+        name = local_env['host_string']
+        # Wrap in another callable that:
+        # * expands the env it's given to ensure parallel, linewise, etc are
+        #   all set correctly and explicitly. Such changes are naturally
+        #   insulted from the parent process.
+        # * nukes the connection cache to prevent shared-access problems
+        # * knows how to send the tasks' return value back over a Queue
+        # * captures exceptions raised by the task
+        def inner(args, kwargs, queue, name, env):
+            state.env.update(env)
+            def submit(result):
+                queue.put({'name': name, 'result': result})
+            try:
+                key = normalize_to_string(state.env.host_string)
+                state.connections.pop(key, "")
+                submit(task.run(*args, **kwargs))
+            except BaseException, e: # We really do want to capture everything
+                # SystemExit implies use of abort(), which prints its own
+                # traceback, host info etc -- so we don't want to double up
+                # on that. For everything else, though, we need to make
+                # clear what host encountered the exception that will
+                # print.
+                if e.__class__ is not SystemExit:
+                    sys.stderr.write("!!! Parallel execution exception under host %r:\n" % name)
+                    submit(e)
+                # Here, anything -- unexpected exceptions, or abort()
+                # driven SystemExits -- will bubble up and terminate the
+                # child process.
+                raise
 
-    with settings(**local_env):
-        if jobs is None or queue is None:
+        # Stuff into Process wrapper
+        kwarg_dict = {
+            'args': args,
+            'kwargs': kwargs,
+            'queue': queue,
+            'name': name,
+            'env': local_env,
+        }
+        p = multiprocessing.Process(target=inner, kwargs=kwarg_dict)
+        # Name/id is host string
+        p.name = name
+        # Add to queue
+        jobs.append(p)
+    # Handle serial execution
+    else:
+        with settings(**local_env):
             return task.run(*args, **kwargs)
-        else:
-            import multiprocessing
-
-            # Stuff into Process wrapper
-            kwarg_dict = {
-                'task': task,
-                'args': args,
-                'kwargs': kwargs,
-                'env': copy(state.env),
-                'queue': queue,
-            }
-            kwarg_dict['env'].update({'parallel': True, 'linewise': True})
-
-            job_name = '|'.join([task.role, host])
-            p = multiprocessing.Process(target=parallel_task_target, kwargs=kwarg_dict, name=job_name)
-            # Add to queue
-            jobs.append(p)
 
 
 def _is_task(task):
@@ -214,18 +271,21 @@ def execute(task, *args, **kwargs):
     taskname:host=hostname``.
 
     Any other arguments or keyword arguments will be passed verbatim into
-    ``task`` when it is called, so ``execute(mytask, 'arg1', kwarg1='value')``
-    will (once per host) invoke ``mytask('arg1', kwarg1='value')``.
+    ``task`` (the function itself -- not the ``@task`` decorator wrapping your
+    function!) when it is called, so ``execute(mytask, 'arg1',
+    kwarg1='value')`` will (once per host) invoke ``mytask('arg1',
+    kwarg1='value')``.
 
-    This function returns a dictionary mapping host strings to the given task's
-    return value for that host's execution run. For example, ``execute(foo,
-    hosts=['a', 'b'])`` might return ``{'a': None, 'b': 'bar'}`` if ``foo``
-    returned nothing on host `a` but returned ``'bar'`` on host `b`.
+    :returns:
+        a dictionary mapping host strings to the given task's return value for
+        that host's execution run. For example, ``execute(foo, hosts=['a',
+        'b'])`` might return ``{'a': None, 'b': 'bar'}`` if ``foo`` returned
+        nothing on host `a` but returned ``'bar'`` on host `b`.
 
-    In situations where a task execution fails for a given host but overall
-    progress does not abort (such as when :ref:`env.skip_bad_hosts
-    <skip-bad-hosts>` is True) the return value for that host will be the error
-    object or message.
+        In situations where a task execution fails for a given host but overall
+        progress does not abort (such as when :ref:`env.skip_bad_hosts
+        <skip-bad-hosts>` is True) the return value for that host will be the
+        error object or message.
 
     .. seealso::
         :ref:`The execute usage docs <execute>`, for an expanded explanation
@@ -251,18 +311,11 @@ def execute(task, *args, **kwargs):
         my_env['command'] = getattr(task, 'name', dunder_name)
     # Normalize to Task instance if we ended up with a regular callable
     if not _is_task(task):
-        from fabric.decorators import task as task_decorator
-        task = task_decorator(task)
+        task = WrappedCallableTask(task)
     # Filter out hosts/roles kwargs
     new_kwargs, hosts, roles, exclude_hosts = parse_kwargs(kwargs)
     # Set up host list
     my_env['all_hosts'] = task.get_hosts(hosts, roles, exclude_hosts, state.env)
-
-    # No hosts, just run once locally
-    if not my_env['all_hosts']:
-        with settings(**my_env):
-            results['<local-only>'] = task.run(*args, **new_kwargs)
-        return results
 
     parallel = requires_parallel(task)
     if parallel:
@@ -278,49 +331,64 @@ def execute(task, *args, **kwargs):
     multiprocessing module cannot be imported (see above
     traceback.) Please make sure the module is installed
     or that the above ImportError is fixed.""")
-
-        # Get max pool size for this task
-        pool_size = task.get_pool_size(my_env['all_hosts'], state.env.pool_size)
-        # Set up job comms queue
-        queue = multiprocessing.Queue()
-        role_limits = state.env.get('role_limits', None)
-        jobs = JobQueue(pool_size, queue, role_limits=role_limits, debug=state.output.debug)
     else:
-        queue = None
-        jobs = None
+        multiprocessing = None
 
-    # Attempt to cycle on hosts, skipping if needed
-    for host in my_env['all_hosts']:
-        task.role = task.get_role(host, hosts, state.env)
-        try:
-            results[host] = _execute(task, host, my_env, args, new_kwargs, jobs, queue)
-        except NetworkError, e:
-            results[host] = e
-            # Backwards compat test re: whether to use an exception or
-            # abort
-            if not state.env.use_exceptions_for['network']:
-                func = warn if state.env.skip_bad_hosts else abort
-                error(e.message, func=func, exception=e.wrapped)
-            else:
-                raise
+    # Get pool size for this task
+    pool_size = task.get_pool_size(my_env['all_hosts'], state.env.pool_size)
+    # Set up job queue in case parallel is needed
+    queue = multiprocessing.Queue() if parallel else None
+    jobs = JobQueue(pool_size, queue)
+    if state.output.debug:
+        jobs._debug = True
 
-    if jobs:
-        # If running in parallel, block until job queue is emptied
-        err = "One or more hosts failed while executing task '%s'" % (
-            my_env['command']
-        )
-        jobs.close()
-        # Abort if any children did not exit cleanly (fail-fast).
-        # This prevents Fabric from continuing on to any other tasks.
-        # Otherwise, pull in results from the child run.
-        ran_jobs = jobs.run()
-        for name, d in ran_jobs.iteritems():
-            if d['exit_code'] != 0:
-                if isinstance(d['result'], BaseException):
-                    error(err, exception=d['result'])
+    # Call on host list
+    if my_env['all_hosts']:
+        # Attempt to cycle on hosts, skipping if needed
+        for host in my_env['all_hosts']:
+            try:
+                results[host] = _execute(
+                    task, host, my_env, args, new_kwargs, jobs, queue,
+                    multiprocessing
+                )
+            except NetworkError, e:
+                results[host] = e
+                # Backwards compat test re: whether to use an exception or
+                # abort
+                if not state.env.use_exceptions_for['network']:
+                    func = warn if state.env.skip_bad_hosts else abort
+                    error(e.message, func=func, exception=e.wrapped)
                 else:
-                    error(err)
-            results[name] = d['result']
+                    raise
+
+            # If requested, clear out connections here and not just at the end.
+            if state.env.eagerly_disconnect:
+                disconnect_all()
+
+        # If running in parallel, block until job queue is emptied
+        if jobs:
+            err = "One or more hosts failed while executing task '%s'" % (
+                my_env['command']
+            )
+            jobs.close()
+            # Abort if any children did not exit cleanly (fail-fast).
+            # This prevents Fabric from continuing on to any other tasks.
+            # Otherwise, pull in results from the child run.
+            ran_jobs = jobs.run()
+            for name, d in ran_jobs.iteritems():
+                if d['exit_code'] != 0:
+                    if isinstance(d['results'], BaseException):
+                        error(err, exception=d['results'])
+                    else:
+                        error(err)
+                results[name] = d['results']
+
+    # Or just run once for local-only
+    else:
+        with settings(**my_env):
+            results['<local-only>'] = task.run(*args, **new_kwargs)
+    # Return what we can from the inner task executions
+
 
     # Return what we can from the inner task executions
     return results
